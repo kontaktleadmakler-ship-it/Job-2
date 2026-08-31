@@ -126,7 +126,13 @@ class ScanManager:
                         continue
                 if external and any(x in p.netloc.lower() for x in ("facebook.", "instagram.", "youtube.", "linkedin.com")):
                     continue
-                if not any(x in low for x in ("werkstudent", "praktik", "student", "working", "job", "analyst", "developer", "consulting", "marketing", "finance", "it")):
+                # Do not use anchor keywords alone as proof of a job detail page.
+                # Internal Studis pages must pass the strict source-specific URL
+                # classifier; external links must look like an actual job/ATS URL.
+                if external:
+                    if not is_generic_job_url(href):
+                        continue
+                elif not is_direct_job_url(href, "studis_online"):
                     continue
             elif not is_generic_job_url(href):
                 continue
@@ -155,35 +161,100 @@ class ScanManager:
             return []
 
     async def _enrich(self, client: httpx.AsyncClient, raw: RawJob) -> RawJob | None:
+        """Enrich a concrete job URL.
+
+        Portals may deny direct page fetches even though a public search engine
+        exposed a concrete job URL. In that case we keep the search-engine
+        metadata instead of throwing the candidate away. We never attempt to
+        bypass the portal protection.
+        """
         if not safe_job_url(raw.url):
             return None
+
+        def discovery_fallback(reason: str) -> RawJob | None:
+            if raw.source not in PORTAL_SOURCES:
+                return None
+            if not is_direct_job_url(raw.url, raw.source):
+                return None
+            combined = " ".join((raw.title, raw.description, raw.employment_type)).lower()
+            job_markers = (
+                "werkstudent", "working student", "praktikum", "internship",
+                "stellenangebot", "job", "analyst", "developer", "engineer",
+                "finance", "risk", "controlling", "business intelligence",
+                "data", "recruiting", "customer service"
+            )
+            if not any(m in combined for m in job_markers):
+                return None
+            log.info("PORTAL DISCOVERY FALLBACK source=%s url=%s reason=%s",
+                     raw.source, raw.url, reason)
+            return raw
+
         try:
             r = await client.get(raw.url, timeout=min(15, get_settings().request_timeout), follow_redirects=True)
+            if r.status_code in {401, 403, 407, 429, 451, 500, 502, 503, 504}:
+                fallback = discovery_fallback(f"http_{r.status_code}")
+                if fallback:
+                    return fallback
+                r.raise_for_status()
             r.raise_for_status()
             final_url = str(r.url)
             parsed = parse_html(r.text, final_url, raw.source)
+
+            # Some portals return a consent/anti-bot page with HTTP 200. If it
+            # does not parse as a real JobPosting, retain the concrete search
+            # result rather than repeatedly retrying the protected page.
             if not parsed or len(parsed.title.strip()) < 8:
+                fallback = discovery_fallback("unparseable_page")
+                if fallback:
+                    return fallback
                 return None
-            combined = " ".join((parsed.title, parsed.company, parsed.location, parsed.description, parsed.employment_type)).lower()
-            markers = ("bewerben", "apply", "job description", "stellenangebot", "aufgaben", "qualifikationen", "werkstudent", "vollzeit", "teilzeit", "praktikum", "internship")
+
+            combined = " ".join((parsed.title, parsed.company, parsed.location,
+                                 parsed.description, parsed.employment_type)).lower()
+            markers = (
+                "bewerben", "apply", "job description", "stellenangebot",
+                "aufgaben", "qualifikationen", "werkstudent", "vollzeit",
+                "teilzeit", "praktikum", "internship"
+            )
             if not any(m in combined for m in markers):
+                fallback = discovery_fallback("not_job_content")
+                if fallback:
+                    return fallback
                 return None
-            generic_titles = ("jobs in", "stellenangebote in", "jobsuche", "karriere", "careers", "job search", "stellenmarkt", "jobboerse")
+
+            generic_titles = (
+                "jobs in", "stellenangebote in", "jobsuche", "karriere",
+                "careers", "job search", "stellenmarkt", "jobboerse"
+            )
             structured = has_jobposting_jsonld(r.text)
             if not structured:
-                # Without structured JobPosting data, demand enough page-level evidence
-                # to distinguish a detail page from a portal/search/category page.
-                if (not parsed.company or not parsed.location or len(parsed.description or "") < 250
+                if (not parsed.company or not parsed.location
+                        or len(parsed.description or "") < 250
                         or any(parsed.title.lower().startswith(x) for x in generic_titles)):
+                    fallback = discovery_fallback("listing_or_generic_page")
+                    if fallback:
+                        return fallback
                     return None
+
+            # A portal click may legitimately resolve to the employer's ATS.
+            # Accept that only when the destination itself parses as a concrete
+            # job; never accept a portal homepage/search page.
+            original_host = urlparse(raw.url).netloc.lower().split(":")[0]
+            final_host = urlparse(final_url).netloc.lower().split(":")[0]
             if raw.source != "generic" and not is_direct_job_url(final_url, raw.source):
-                if urlparse(final_url).netloc.lower() != urlparse(raw.url).netloc.lower():
+                if final_host != original_host and not is_generic_job_url(final_url):
+                    fallback = discovery_fallback("unexpected_redirect")
+                    if fallback:
+                        return fallback
                     return None
+
             if not parsed.company or not parsed.location:
-                # Keep unknown fields only when the page has structured JobPosting
-                # data; otherwise listing/search pages are too risky.
                 if len(parsed.description or "") < 180:
+                    fallback = discovery_fallback("missing_job_fields")
+                    if fallback:
+                        return fallback
                     return None
+
             raw.title = parsed.title or raw.title
             raw.company = parsed.company or raw.company
             raw.location = parsed.location or raw.location
@@ -195,9 +266,20 @@ class ScanManager:
             raw.posted_date = parsed.posted_date or raw.posted_date
             raw.url = final_url
             return raw
+        except httpx.HTTPStatusError as e:
+            fallback = discovery_fallback(f"http_{e.response.status_code}")
+            if fallback:
+                return fallback
+            log.debug("job enrichment HTTP failure %s: %s", raw.url, e)
+            return None
         except Exception as e:
+            fallback = discovery_fallback("request_or_parse_error")
+            if fallback:
+                return fallback
             log.debug("job enrichment failed %s: %s", raw.url, e)
             return None
+
+    
 
     async def _discover_fallback(self, discovery, query):
         jobs = []
@@ -220,7 +302,13 @@ class ScanManager:
             headers = {"User-Agent": settings.user_agent, "Accept-Language": "de-DE,de;q=0.8,en;q=0.6"}
             try:
                 async with httpx.AsyncClient(timeout=settings.request_timeout, headers=headers, limits=limits, follow_redirects=True) as client:
-                    discovery = PublicDiscovery(client, settings.discovery_max_results, 1.0 / max(settings.request_rate_per_second, 0.1), settings.discovery_timeout)
+                    discovery = PublicDiscovery(
+                        client,
+                        settings.discovery_max_results,
+                        1.0 / max(settings.request_rate_per_second, 0.1),
+                        settings.discovery_timeout,
+                        preferred_provider=settings.discovery_provider,
+                    )
                     collectors = {
                         "stepstone": StepStoneCollector(), "indeed": IndeedCollector(), "generic": GenericCollector(),
                         "xing": XingCollector(), "monster": MonsterCollector(), "jobware": JobwareCollector(),
@@ -256,6 +344,12 @@ class ScanManager:
                                     # detail pages. Listing pages are expanded separately above.
                                     if candidate.source != "generic" and not self._is_listing_page(candidate.url) and not is_direct_job_url(candidate.url, candidate.source):
                                         log.info("SKIP non-detail source=%s URL=%s", candidate.source, candidate.url)
+                                        continue
+                                    # Generic discovery is allowed to discover listings,
+                                    # but once a listing has been expanded only concrete
+                                    # job-looking URLs may be fetched as detail candidates.
+                                    if candidate.source == "generic" and not is_generic_job_url(candidate.url):
+                                        log.info("SKIP generic non-detail URL=%s", candidate.url)
                                         continue
                                     enriched = await self._enrich(client, candidate)
                                     if not enriched:

@@ -106,9 +106,27 @@ def is_direct_job_url(url: str, source: str) -> bool:
     if source == "arbeitsagentur":
         return "/jobdetail/" in path
     if source == "studis_online":
-        if (p.netloc.lower().split(":")[0].endswith("studis-online.de") and path in {"/jobben/werkstudent.php", "/jobben/studentenjobs.php"}):
-            return False
-        return "/jobben/" in path and len([x for x in path.split("/") if x]) >= 2
+        # The /jobben/ area contains many editorial/info pages (werkstudent.php,
+        # minijob.php, einkommensgrenzen.php, ...). Treat only extensionless job
+        # slugs or explicit job-query URLs as possible internal detail pages.
+        if p.netloc.lower().split(":")[0].endswith("studis-online.de"):
+            if path in {"/jobben/werkstudent.php", "/jobben/studentenjobs.php"}:
+                return False
+            if not path.startswith("/jobben/"):
+                return False
+            if path.endswith(".php") or path.endswith(".html"):
+                return False
+            segments = [x for x in path.split("/") if x]
+            return len(segments) >= 2 and any(
+                token in path for token in (
+                    "werkstudent", "student", "praktik", "intern",
+                    "analyst", "developer", "engineer", "consult", "marketing",
+                    "finance", "controlling", "it-", "data", "business"
+                )
+            )
+        # External ATS/employer links found on Studis listings must themselves
+        # look like job-detail URLs.
+        return is_generic_job_url(url)
     if source in {"monster", "jobware", "kimeta"}:
         return any(x in path for x in DIRECT_PATH_HINTS) or any(k in query for k in JOB_QUERY_HINTS)
     return is_generic_job_url(url)
@@ -138,7 +156,8 @@ class PublicDiscovery:
     This intentionally does not attempt to defeat anti-bot controls. A blocked provider is
     marked unavailable and the next provider is used instead.
     """
-    def __init__(self, client: httpx.AsyncClient, max_results=10, min_interval=0.75, request_timeout=8.0):
+    def __init__(self, client: httpx.AsyncClient, max_results=10, min_interval=0.75,
+                 request_timeout=8.0, preferred_provider: str | None = None):
         self.client = client
         self.max_results = max(1, int(max_results))
         self.min_interval = max(0.2, float(min_interval))
@@ -147,6 +166,8 @@ class PublicDiscovery:
         self._last_request = 0.0
         self.last_provider = None
         self.last_error = None
+        preferred = (preferred_provider or "bing").strip().lower()
+        self.providers = [preferred] + [p for p in SEARCH_ENGINES if p != preferred]
         self.provider_state = {p: "ready" for p in SEARCH_ENGINES}
 
     async def _throttle(self):
@@ -218,8 +239,22 @@ class PublicDiscovery:
             is_known_listing = (hhost.endswith("studis-online.de") and hpath in {"/jobben/werkstudent.php", "/jobben/studentenjobs.php"})
             if not is_generic_job_url(href) and not is_known_listing:
                 return None
+        # Search-engine snippets are a legitimate fallback when a portal blocks
+        # direct enrichment.  Keep only concrete, source-domain URLs; never turn
+        # a portal homepage/search page into a job.
+        company = ""
+        location = ""
+        parts = [normalize_space(x) for x in re.split(r"\\s*[·|]\\s*", snippet) if normalize_space(x)]
+        if parts:
+            for part in parts:
+                if not location and re.search(r"\\b\\d{5}\\b|\\bberlin\\b|\\bpotsdam\\b|\\bhamburg\\b|\\bmünchen\\b|\\bfrankfurt\\b", part, re.I):
+                    location = part[:300]
+                    continue
+                if not company and len(part) <= 160 and not any(re.search(p, part, re.I) for p in JOB_TEXT_HINTS):
+                    company = part[:300]
         return RawJob(
-            title=title[:500], description=snippet[:4000], url=href,
+            title=title[:500], company=company, location=location,
+            description=snippet[:4000], url=href,
             source=source, employment_type=infer_employment_type(" ".join((title, snippet)))
         )
 
@@ -299,7 +334,7 @@ class PublicDiscovery:
 
     async def search(self, q: str, source: str) -> list[RawJob]:
         errors = []
-        for provider in SEARCH_ENGINES:
+        for provider in self.providers:
             try:
                 rows = await self._engine(q, source, provider)
                 if rows:
